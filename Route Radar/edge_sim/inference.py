@@ -1,42 +1,36 @@
+# pyrefly: ignore [missing-import]
 import cv2
 import base64
 import requests
 import os
-import math
+import json
 import threading
 import queue
 import numpy as np
-from collections import defaultdict
 from ultralytics import YOLO
+
 from gps_simulator import RouteSimulator
+from detection.pothole_detector import PotholeDetector
+from detection.vehicle_detector import VehicleDetector
+from tracking.pothole_tracker import PotholeTracker
+from assessment.severity import SeverityAssessor
+from assessment.risk_score import RiskScorer
+from assessment.action_recommender import ActionRecommender
+from rules.rules_engine import RulesEngine
+from reporting.annotator import Annotator
+from reporting.event_store import EventStore
 
 # ============================================================
-# CONFIGURATION
+# PATHS
 # ============================================================
-BACKEND_URL = "http://127.0.0.1:8000/api/events/"
-MODEL_PATH = "yolov8n.pt"
-VIDEO_PATH = "sample.mp4"
-OUTPUT_PATH = "busense_result.mp4"
-
-# Simulated route
-START_LAT = 12.9716
-START_LON = 77.5946
-END_LAT = 12.9352
-END_LON = 77.6245
-
-# Detection thresholds
-TRAFFIC_DENSITY_THRESHOLD = 5
-RASH_DRIVING_DISPLACEMENT_THRESHOLD = 60
-TRAFFIC_COOLDOWN_SECONDS = 10
-ANOMALY_COOLDOWN_SECONDS = 5
-FRAME_SKIP = 2  # Process every Nth frame for YOLO inference
-
-def encode_image(img):
-    _, buffer = cv2.imencode(".jpg", img)
-    return base64.b64encode(buffer).decode("utf-8")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE)
+_MODELS_DIR = os.path.join(_PROJECT_ROOT, "models")
+_CONFIG_DIR = os.path.join(_HERE, "config")
+_RULES_DIR = os.path.join(_HERE, "rules", "india")
 
 # ============================================================
-# ASYNC EVENT DISPATCHER
+# EVENT DISPATCHER
 # ============================================================
 class EventDispatcher(threading.Thread):
     def __init__(self, backend_url):
@@ -49,13 +43,14 @@ class EventDispatcher(threading.Thread):
         while self.running:
             try:
                 payload = self.queue.get(timeout=1)
-                requests.post(self.backend_url, json=payload, timeout=2)
+                try:
+                    requests.post(self.backend_url, json=payload, timeout=2)
+                except Exception as e:
+                    # Ignore connection errors in demo mode
+                    pass
                 self.queue.task_done()
             except queue.Empty:
                 continue
-            except Exception as e:
-                # Backend might be down, ignore in demo to keep edge running
-                pass 
 
     def send_event(self, payload):
         self.queue.put(payload)
@@ -63,250 +58,207 @@ class EventDispatcher(threading.Thread):
     def stop(self):
         self.running = False
 
-# ============================================================
-# ROAD ANOMALY DETECTOR (CV FALLBACK)
-# ============================================================
-class RoadAnomalyDetector:
-    def __init__(self):
-        pass
-
-    def detect(self, frame):
-        """
-        CV-based fallback for detecting road anomalies (e.g., potholes, cracks).
-        Returns a list of bounding boxes (x, y, w, h) for detected anomalies.
-        """
-        height, width = frame.shape[:2]
-        
-        # Define ROI: bottom center of the frame (road directly in front)
-        roi_y1 = int(height * 0.6)
-        roi_y2 = int(height * 0.95)
-        roi_x1 = int(width * 0.25)
-        roi_x2 = int(width * 0.75)
-        
-        roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-        
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-        edges = cv2.Canny(blurred, 50, 150)
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
-        
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        anomalies = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if 500 < area < 5000: # Threshold for "pothole" size
-                x, y, w, h = cv2.boundingRect(cnt)
-                # Filter out long horizontal/vertical lines (lane markings)
-                if 0.2 < w/h < 5: 
-                    anomalies.append((x + roi_x1, y + roi_y1, w, h))
-                    
-        return anomalies
+def encode_thumbnail(img, box, padding=40):
+    """Crop the pothole bounding box (with padding) and encode as a small JPEG thumbnail.
+    This keeps API payloads tiny vs. encoding the entire full-resolution frame."""
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = box
+    x1 = max(0, x1 - padding)
+    y1 = max(0, y1 - padding)
+    x2 = min(w, x2 + padding)
+    y2 = min(h, y2 + padding)
+    crop = img[y1:y2, x1:x2]
+    if crop.size == 0:
+        crop = img  # fallback to full frame if box is degenerate
+    # Resize to a small fixed thumbnail
+    thumb = cv2.resize(crop, (320, 240), interpolation=cv2.INTER_AREA)
+    _, buffer = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    return base64.b64encode(buffer).decode("utf-8")
 
 # ============================================================
-# MAIN
+# MAIN ORCHESTRATOR
 # ============================================================
 def main():
-    if not os.path.exists(VIDEO_PATH):
-        print(f"Error: Video {VIDEO_PATH} not found.")
+    # Load Configurations
+    with open(os.path.join(_CONFIG_DIR, "road_context.json"), "r") as f:
+        road_context = json.load(f)
+        
+    with open(os.path.join(_CONFIG_DIR, "thresholds.json"), "r") as f:
+        thresholds = json.load(f)
+
+    # Setup Backend/Dispatcher
+    backend_url = "http://127.0.0.1:8000/api/events/"
+    dispatcher = EventDispatcher(backend_url)
+    dispatcher.start()
+
+    # Initialize Modules
+    print("Initializing Rules Engine...")
+    rules_engine = RulesEngine(_RULES_DIR)
+    
+    print("Loading Models...")
+    # Load models
+    vehicle_model_path = os.path.join(_HERE, "yolov8n.pt")
+    pothole_model_path = os.path.join(_MODELS_DIR, "pothole_yolov8s.pt")
+    
+    if not os.path.exists(pothole_model_path):
+        print(f"ERROR: Pothole model not found at {pothole_model_path}. Run download_pothole_model.py first.")
         return
 
-    print("Loading YOLOv8 model for vehicles...")
-    model = YOLO(MODEL_PATH)
-
-    cap = cv2.VideoCapture(VIDEO_PATH)
+    vehicle_yolo = YOLO(vehicle_model_path)
+    pothole_yolo = YOLO(pothole_model_path)
+    
+    # Instantiate Pipeline Components
+    vehicle_detector = VehicleDetector(vehicle_yolo)
+    pothole_detector = PotholeDetector(pothole_yolo, road_context, thresholds)
+    pothole_tracker = PotholeTracker(thresholds)
+    severity_assessor = SeverityAssessor(thresholds)
+    risk_scorer = RiskScorer(thresholds)
+    action_recommender = ActionRecommender(rules_engine)
+    annotator = Annotator()
+    event_store = EventStore(_HERE, road_context.get("session_id", "SESSION-DEFAULT"))
+    
+    # Video Setup
+    video_path = os.path.join(_HERE, "sample.mp4")  # 27MB — fast for testing; switch to sample.mp4 for full run
+    output_path = os.path.join(_HERE, "busense_result.mp4")
+    
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print("Could not open video.")
+        print(f"Could not open video: {video_path}")
         return
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    total_duration = frame_count / fps if fps > 0 else 60
+    duration = frame_count / fps if fps > 0 else 60
 
-    print(f"Video resolution : {width}x{height}")
-    print(f"FPS              : {fps:.2f}")
-    print(f"Frames           : {frame_count}")
-    print(f"Duration         : {total_duration:.2f} seconds")
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(OUTPUT_PATH, fourcc, fps, (width, height))
-    if not out.isOpened():
-        print("ERROR: Could not create output video.")
-        cap.release()
-        return
-
-    route_sim = RouteSimulator(START_LAT, START_LON, END_LAT, END_LON, total_duration)
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     
-    # Initialize components
-    dispatcher = EventDispatcher(BACKEND_URL)
-    dispatcher.start()
+    # GPS Simulator
+    route_sim = RouteSimulator(12.9716, 77.5946, 12.9352, 77.6245, duration)
     
-    anomaly_detector = RoadAnomalyDetector()
-
-    # Tracking states
-    track_history = defaultdict(lambda: [])
-    reported_rash_ids = set()
-    
-    is_congested = False
-    congestion_clear_timer = 0
-    
-    last_anomaly_time = 0
+    # Execution State
     frame_idx = 0
+    frame_skip = thresholds.get("detection", {}).get("frame_skip", {}).get("value", 2)
+    last_vehicles = []
+    last_persons = []
+    last_pothole_anomalies = []
+    last_masks = []
+    reported_potholes = set()
     
-    # COCO vehicle class names
-    class_names = {2: "Car", 3: "Motorcycle", 5: "Bus", 7: "Truck"}
-    relevant_classes = [2, 3, 5, 7]
-
-    # Store last detections to draw on skipped frames
-    last_boxes = []
-    last_anomalies = []
-
-    print("Starting inference loop...")
+    print("Starting Pipeline...")
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
+            
         current_time = frame_idx / fps
         lat, lon = route_sim.get_coordinate_for_time(current_time)
-        vehicle_count = 0
-
-        # Frame skipping for heavy object detection
-        if frame_idx % FRAME_SKIP == 0:
-            # Run YOLO on scaled-down image (imgsz=480) for speed, and filter classes
-            results = model.track(frame, persist=True, verbose=False, classes=relevant_classes, imgsz=480)
-            
-            current_boxes = []
-            for r in results:
-                boxes = r.boxes
-                if boxes is None:
-                    continue
-
-                for i, box in enumerate(boxes):
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    
-                    track_id = int(boxes.id[i]) if boxes.id is not None else -1
-                    current_boxes.append((x1, y1, x2, y2, cls_id, conf, track_id))
-                    
-            last_boxes = current_boxes
-            
-            # Detect road anomalies dynamically
-            last_anomalies = anomaly_detector.detect(frame)
         
-        # Process detections (using last_boxes even on skipped frames to maintain visual continuity)
-        for x1, y1, x2, y2, cls_id, conf, track_id in last_boxes:
-            vehicle_count += 1
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
+        # 1. Detection Phase (skip frames for performance)
+        if frame_idx % frame_skip == 0:
+            last_vehicles, last_persons = vehicle_detector.detect(frame)
+            last_pothole_anomalies, last_masks = pothole_detector.detect(
+                frame, last_vehicles, last_persons
+            )
             
-            is_rash = False
-            if track_id != -1:
-                # Rash driving detection
-                history = track_history[track_id]
+        # Update context
+        road_context["vehicle_count"] = len(last_vehicles)
+        frame_brightness = frame.mean()
+        
+        # 2. Tracking Phase
+        active_potholes = pothole_tracker.update(last_pothole_anomalies, frame_idx, current_time)
+        
+        # Check for clustering
+        cluster_count = len(active_potholes) # Simplification: all active in frame are a cluster
+        road_context["cluster_count"] = cluster_count
+        
+        # 3. Assessment & Rules Phase
+        for record in active_potholes:
+            pid = record["pothole_id"]
+            
+            # Update GPS
+            if road_context.get("gps_available", True):
+                pothole_tracker.update_record_gps(pid, lat, lon)
+                record["gps_lat"] = lat
+                record["gps_lon"] = lon
                 
-                # Only update history on active frames or if skipped, rely on last known. 
-                # For simplicity, we just append current center.
-                if frame_idx % FRAME_SKIP == 0:
-                    history.append((cx, cy))
-                    if len(history) > 5:
-                        history.pop(0)
-
-                if len(history) >= 2:
-                    prev_cx, prev_cy = history[-2]
-                    displacement = math.sqrt((cx - prev_cx)**2 + (cy - prev_cy)**2)
-                    
-                    if displacement > RASH_DRIVING_DISPLACEMENT_THRESHOLD and track_id not in reported_rash_ids:
-                        is_rash = True
-                        reported_rash_ids.add(track_id)
-                        
-                        dispatcher.send_event({
-                            "lat": lat, "lon": lon, "severity": "high",
-                            "event_type": "Rash Driving", "image_data": encode_image(frame)
-                        })
-                        print(f"Event: Rash Driving [ID: {track_id}] at {current_time:.2f}s")
+            # Assess Severity
+            sev_label, sev_level = severity_assessor.assess(record, frame, road_context.get("road_type"))
+            record["severity"] = sev_label
+            record["severity_level"] = sev_level
             
-            # Draw box
-            box_color = (0, 165, 255) if is_rash else (255, 0, 0)
-            label = "RASH DRIVING" if is_rash else f"{class_names.get(cls_id, 'Vehicle')} {conf:.2f}"
+            # Assess Risk
+            risk_score, reasons = risk_scorer.calculate_risk(record, road_context, frame_brightness)
+            record["risk_score"] = risk_score
+            record["reason_breakdown"] = reasons
             
-            cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-            cv2.rectangle(frame, (x1, max(0, y1 - 25)), (x1 + 150, y1), box_color, -1)
-            cv2.putText(frame, label, (x1 + 5, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            # Recommend Action
+            priority, action, response_time, source = action_recommender.recommend(
+                sev_label, sev_level, road_context.get("road_type")
+            )
+            record["action_priority"] = priority
+            record["recommended_action"] = action
             
-            if track_id != -1:
-                cv2.putText(frame, f"ID:{track_id}", (x1, y2 + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            # Apply Rules Engine Flags
+            context_snapshot = {
+                "road_type": road_context.get("road_type"),
+                "pothole_detected": True,
+                "lane_position": record.get("lane_position"),
+                "water_detected": record.get("water_detected"),
+                "cluster_count": cluster_count,
+                "high_traffic": road_context["vehicle_count"] > thresholds.get("risk", {}).get("traffic_density_high_threshold", {}).get("value", 8),
+                "vulnerable_users_present": road_context.get("vulnerable_users_present", False),
+                "poor_visibility": frame_brightness < thresholds.get("risk", {}).get("visibility_dark_threshold", {}).get("value", 80)
+            }
+            
+            matched_pavement = rules_engine.evaluate_pavement_rules(context_snapshot)
+            matched_safety = rules_engine.evaluate_safety_rules(context_snapshot)
+            record["matched_rules"] = [r["rule_id"] for r in matched_pavement + matched_safety]
+            
+            # Update tracker state
+            pothole_tracker.update_record_assessment(pid, sev_label, risk_score)
+            
+            # 4. Dispatch and Store Evidence (Once per newly confirmed pothole)
+            if record.get("is_newly_confirmed") and pid not in reported_potholes:
+                reported_potholes.add(pid)
+                
+                box_coords = record.get("box", [0, 0, 1, 1])
+                payload = {
+                    "event_id": pid,
+                    "event_type": "Pothole",
+                    "lat": lat,
+                    "lon": lon,
+                    "severity_level": sev_level,
+                    "severity_label": sev_label,
+                    "risk_score": risk_score,
+                    "action_priority": priority,
+                    "recommended_action": action,
+                    "reason_breakdown": json.dumps(reasons),
+                    "road_type": road_context.get("road_type"),
+                    "matched_rules": json.dumps(record["matched_rules"]),
+                    "image_data": encode_thumbnail(frame, list(map(int, box_coords)))
+                }
+                dispatcher.send_event(payload)
+                
+                # Save to disk
+                event_store.save_event(record, frame)
+                print(f"[{current_time:.1f}s] Event Dispatch: {pid} ({sev_label}, Risk: {risk_score})")
 
-        # Traffic Congestion Deduplication
-        if vehicle_count > TRAFFIC_DENSITY_THRESHOLD:
-            congestion_clear_timer = 0
-            if not is_congested:
-                is_congested = True
-                dispatcher.send_event({
-                    "lat": lat, "lon": lon, "severity": "medium",
-                    "event_type": "Traffic Congestion Started", "image_data": encode_image(frame)
-                })
-                print(f"Event: Traffic Congestion Started at {current_time:.2f}s")
-        else:
-            if is_congested:
-                congestion_clear_timer += 1
-                if congestion_clear_timer > fps * TRAFFIC_COOLDOWN_SECONDS:
-                    is_congested = False
-                    dispatcher.send_event({
-                        "lat": lat, "lon": lon, "severity": "low",
-                        "event_type": "Traffic Congestion Cleared", "image_data": encode_image(frame)
-                    })
-                    print(f"Event: Traffic Cleared at {current_time:.2f}s")
-
-        # Draw road anomalies on every frame
-        for (ax, ay, aw, ah) in last_anomalies:
-            cv2.rectangle(frame, (ax, ay), (ax+aw, ay+ah), (0, 0, 255), 2)
-            cv2.putText(frame, "ROAD ANOMALY", (ax, ay - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-
-        # Dispatch event with cooldown
-        if last_anomalies and (current_time - last_anomaly_time > ANOMALY_COOLDOWN_SECONDS):
-            dispatcher.send_event({
-                "lat": lat, "lon": lon, "severity": "medium",
-                "event_type": "Road Hazard (CV Detected)", "image_data": encode_image(frame)
-            })
-            print(f"Event: Road Hazard detected at {current_time:.2f}s")
-            last_anomaly_time = current_time
-
-        # Information Panel
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (450, 130), (0, 0, 0), -1)
-        frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
-
-        cv2.putText(frame, "BUSENSE - EDGE AI (OPTIMIZED)", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, f"Vehicles: {vehicle_count}", (15, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"GPS: {lat:.5f}, {lon:.5f}", (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"Time: {current_time:.1f}s", (15, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # 5. Annotation Phase
+        annotated_frame = annotator.annotate_frame(frame, active_potholes, last_masks, road_context)
+        out.write(annotated_frame)
         
-        if is_congested:
-            cv2.putText(frame, "TRAFFIC CONGESTION", (250, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-
-        out.write(frame)
         frame_idx += 1
-
-        if frame_idx % 100 == 0:
-            progress = (frame_idx / frame_count) * 100 if frame_count > 0 else 0
-            print(f"Processing: {progress:.1f}%")
+        if frame_idx % 50 == 0:
+            print(f"Processing: {frame_idx}/{frame_count} frames")
 
     # Cleanup
     cap.release()
     out.release()
     dispatcher.stop()
     dispatcher.join()
-
-    print("\n==========================================")
-    print("INFERENCE COMPLETE")
-    print(f"Output saved as: {OUTPUT_PATH}")
-    print("==========================================")
+    print("Inference Complete.")
 
 if __name__ == "__main__":
     main()
