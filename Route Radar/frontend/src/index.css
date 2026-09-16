@@ -1,45 +1,171 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
 @import "tailwindcss";
 
-@layer base {
-  body {
-    @apply bg-slate-900 text-slate-200 antialiased font-sans;
-  }
+/* ─── Design Tokens ─────────────────────────────────────────────────── */
+:root {
+  --bg-deep:      #060b14;
+  --bg-base:      #0d1520;
+  --bg-surface:   #111d2e;
+  --bg-elevated:  #162035;
+  --bg-hover:     #1c2a42;
+
+  --border-subtle: rgba(255,255,255,0.06);
+  --border-soft:   rgba(255,255,255,0.10);
+  --border-accent: rgba(59,130,246,0.35);
+
+  --text-primary:   #f0f6ff;
+  --text-secondary: #8ba3c1;
+  --text-muted:     #4a6080;
+
+  --accent-blue:    #3b82f6;
+  --accent-cyan:    #06b6d4;
+  --accent-red:     #ef4444;
+  --accent-orange:  #f97316;
+  --accent-amber:   #f59e0b;
+  --accent-green:   #22c55e;
+
+  --glow-blue:   0 0 20px rgba(59,130,246,0.25);
+  --glow-red:    0 0 20px rgba(239,68,68,0.25);
+  --glow-orange: 0 0 20px rgba(249,115,22,0.20);
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
 }
 
-/* Leaflet map container defaults */
+/* ─── Base ───────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ─── Leaflet Map ────────────────────────────────────────────────────── */
 .leaflet-container {
-  font-family: inherit;
-  background-color: #1e293b;
+  font-family: 'Inter', sans-serif;
+  background-color: var(--bg-deep);
 }
 
-/* Custom dark theme popup overrides */
+/* Dark-tint over map tiles */
+.leaflet-tile-pane {
+  filter: brightness(0.85) contrast(1.05) saturate(0.9);
+}
+
+/* Attribution */
+.leaflet-control-attribution {
+  background: rgba(6,11,20,0.75) !important;
+  color: var(--text-muted) !important;
+  font-size: 9px !important;
+  backdrop-filter: blur(4px);
+}
+.leaflet-control-attribution a { color: var(--text-muted) !important; }
+
+/* Zoom controls */
+.leaflet-control-zoom a {
+  background: var(--bg-elevated) !important;
+  color: var(--text-secondary) !important;
+  border-color: var(--border-soft) !important;
+  transition: all 0.15s ease;
+}
+.leaflet-control-zoom a:hover {
+  background: var(--bg-hover) !important;
+  color: var(--text-primary) !important;
+}
+
+/* Popup */
 .leaflet-popup-content-wrapper {
-  background: #1e293b !important;
-  color: #f8fafc !important;
-  border: 1px solid #334155;
-  border-radius: 0.5rem !important;
+  background: var(--bg-elevated) !important;
+  color: var(--text-primary) !important;
+  border: 1px solid var(--border-soft) !important;
+  border-radius: var(--radius-lg) !important;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5), var(--glow-blue) !important;
+  backdrop-filter: blur(12px);
+  padding: 0 !important;
 }
-
-.leaflet-popup-tip {
-  background: #1e293b !important;
-  border: 1px solid #334155;
+.leaflet-popup-content {
+  margin: 0 !important;
+  line-height: 1.5;
 }
-
+.leaflet-popup-tip-container { display: none; }
 .leaflet-popup-close-button {
-  color: #cbd5e1 !important;
+  color: var(--text-muted) !important;
+  font-size: 16px !important;
+  top: 8px !important;
+  right: 8px !important;
+  width: 20px !important;
+  height: 20px !important;
+  line-height: 20px !important;
+}
+.leaflet-popup-close-button:hover { color: var(--text-primary) !important; }
+
+/* ─── Custom Scrollbar ───────────────────────────────────────────────── */
+.custom-scrollbar { scrollbar-width: thin; scrollbar-color: #2a3a54 transparent; }
+.custom-scrollbar::-webkit-scrollbar { width: 4px; }
+.custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #2a3a54;
+  border-radius: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #3b4f6a; }
+
+/* ─── Glassmorphism Panel ────────────────────────────────────────────── */
+.glass-panel {
+  background: rgba(13,21,32,0.85);
+  backdrop-filter: blur(16px) saturate(1.4);
+  border: 1px solid var(--border-subtle);
 }
 
-/* Custom scrollbar */
-.custom-scrollbar::-webkit-scrollbar {
-  width: 6px;
+/* ─── Risk Score Bar ─────────────────────────────────────────────────── */
+.risk-bar-track {
+  height: 4px;
+  background: rgba(255,255,255,0.07);
+  border-radius: 99px;
+  overflow: hidden;
 }
-.custom-scrollbar::-webkit-scrollbar-track {
-  background: #1e293b; 
+.risk-bar-fill {
+  height: 100%;
+  border-radius: 99px;
+  transition: width 0.6s cubic-bezier(0.4,0,0.2,1);
 }
-.custom-scrollbar::-webkit-scrollbar-thumb {
-  background: #475569; 
-  border-radius: 3px;
+
+/* ─── Slide-in Panel ─────────────────────────────────────────────────── */
+.slide-in-panel {
+  animation: slideInRight 0.25s cubic-bezier(0.4,0,0.2,1) both;
 }
-.custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: #64748b; 
+@keyframes slideInRight {
+  from { transform: translateX(100%); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+
+/* ─── Pulse ring on live indicator ──────────────────────────────────── */
+.live-dot {
+  position: relative;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--accent-green);
+  box-shadow: 0 0 6px var(--accent-green);
+}
+.live-dot::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-green);
+  animation: ping 1.5s ease-out infinite;
+  opacity: 0;
+}
+@keyframes ping {
+  0%   { transform: scale(0.8); opacity: 0.8; }
+  100% { transform: scale(1.8); opacity: 0; }
 }
